@@ -1,4 +1,4 @@
-"""ATLAS OSINT PRO v0.4.2 — passive, source-linked investigation gateway.
+"""ATLAS OSINT PRO v0.4.3 — passive, source-linked investigation gateway.
 Developer: Suat DOĞU. Public data only. No intrusive scanning.
 Run: uvicorn main:app --host 0.0.0.0 --port 10000
 """
@@ -22,7 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 ROOT = Path(__file__).resolve().parent
 APP_TOKEN = os.environ.get("OSINT_APP_TOKEN", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -651,6 +651,50 @@ async def sources(x_osint_key: str | None = Header(default=None)):
     return {"sources": [{"id": k, "name": v, "type": "REST (on-demand)"} for k, v in KINDS.items()],
             "live": ["mempool.space WebSocket (browser direct)"], "source_health": _source_health}
 
+
+
+@app.post("/api/investigate-detailed")
+async def investigate_detailed(payload: SearchRequest, request: Request,
+                               x_osint_key: str | None = Header(default=None)):
+    """Uncached one-shot query with per-source outcomes, useful when no records match.
+
+    Empty results indicate no matching records from the checked source, not absence
+    of a person from the internet. No identity matching or private data enrichment.
+    """
+    require_token(x_osint_key)
+    check_rate_limit(request.client.host if request and request.client else "unknown")
+    try:
+        query = validate(payload.kind, payload.query)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async with make_client() as client:
+        async def checked(label: str, coro):
+            start = time.monotonic()
+            rows = await source_job(label, coro)
+            good = sum(row.get("status") != "error" for row in rows)
+            failed = [row for row in rows if row.get("status") == "error"]
+            state = "partial" if good and failed else "error" if failed else "ok" if good else "empty"
+            return rows, {
+                "source": label,
+                "status": state,
+                "records": good,
+                "errors": len(failed),
+                "detail": failed[0].get("description", "") if failed else "",
+                "duration_ms": round((time.monotonic() - start) * 1000),
+                "checked_at": now(),
+            }
+        providers = get_tasks(client, payload.kind, query)
+        checks = await asyncio.gather(*(checked(label, coro) for label, coro in providers))
+    records = [attach_evidence_metadata(record, payload.kind, query)
+               for batch, _ in checks for record in batch]
+    summary = [status for _, status in checks]
+    return {"kind": payload.kind, "query": query,
+            "results": records, "source_checks": summary,
+            "checked_sources": len(summary), "record_count": sum(x.get("status") != "error" for x in records),
+            "error_count": sum(x.get("status") == "error" for x in records),
+            "cached": False, "checked_at": now(),
+            "scope_note": "Yalnız belirtilen kamuya açık veri kaynakları sorgulandı. Eşleşmemesi, internette bilgi bulunmadığı anlamına gelmez."}
 
 @app.post("/api/investigate")
 async def investigate_rest(payload: SearchRequest, x_osint_key: str | None = Header(default=None), request: Request = None):
