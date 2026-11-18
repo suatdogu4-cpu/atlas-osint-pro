@@ -1,10 +1,11 @@
-"""ATLAS OSINT PRO v0.2 — passive, source-linked investigation gateway.
+"""ATLAS OSINT PRO v0.3 — passive, source-linked investigation gateway.
 Developer: Suat DOĞU. Public data only. No intrusive scanning.
 Run: uvicorn main:app --host 0.0.0.0 --port 10000
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -20,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ROOT = Path(__file__).resolve().parent
 APP_TOKEN = os.environ.get("OSINT_APP_TOKEN", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -131,6 +132,20 @@ def item(source, title, description, url="", fields=None):
         "checked_at": now(),
         "status": "ok", "evidence_level": "source_record",
     }
+
+
+
+def attach_evidence_metadata(record: dict, kind: str, query: str) -> dict:
+    """Source-record SHA-256 digest: integrity identifier, NOT proof of truth/authenticity."""
+    result = dict(record)
+    result["query_kind"] = kind
+    result["query"] = query
+    fields = ("query_kind", "query", "source", "title", "description", "url",
+              "fields", "checked_at", "status")
+    canonical = json.dumps({k: result.get(k) for k in fields},
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    result["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return result
 
 
 async def get_json(client: httpx.AsyncClient, url: str, params=None, headers=None, max_bytes=3_000_000):
@@ -354,7 +369,7 @@ async def source_job(label: str, coroutine):
     start = time.monotonic()
     try:
         results = await coroutine
-        status = "ok" if results else "empty"
+        status = "partial" if results and any(x.get("status") == "error" for x in results) else ("ok" if results else "empty")
         _source_health[label] = {"status": status, "last_attempt": now(),
                                  "last_success": now(), "latency_ms": round((time.monotonic()-start)*1000)}
         return results
@@ -391,7 +406,7 @@ def get_tasks(client, kind, q):
 
 def make_client():
     return httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True,
-                             headers={"User-Agent": "AtlasOSINTPro/0.2 (passive research)"},
+                             headers={"User-Agent": "AtlasOSINTPro/0.3 (passive research)"},
                              limits=httpx.Limits(max_connections=10))
 
 
@@ -404,7 +419,7 @@ async def investigate(kind: str, query: str):
     async with make_client() as client:
         tasks = [source_job(name, task) for name, task in get_tasks(client, kind, q)]
         response = await asyncio.gather(*tasks)
-        out = [row for group in response for row in group]
+        out = [attach_evidence_metadata(row, kind, q) for group in response for row in group]
     # Do not cache failures; the next request must be able to retry.
     if not any(x.get("status") == "error" for x in out):
         if len(_cache) >= MAX_CACHE_ENTRIES:
@@ -421,7 +436,8 @@ async def home():
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "version": VERSION, "protected": bool(APP_TOKEN),
-            "ready": bool(APP_TOKEN), "sources": len(KINDS), "time_utc": now()}
+            "ready": bool(APP_TOKEN), "sources": len(KINDS), "time_utc": now(),
+            "features": ["evidence_sha256", "relationship_graph", "timeline", "source_comparison", "case_export"]}
 
 
 @app.get("/api/sources")
@@ -483,8 +499,9 @@ async def investigate_ws(ws: WebSocket):
                 for completed in asyncio.as_completed(tasks):
                     batch = await completed
                     for x in batch:
-                        results.append(x)
-                        await ws.send_json({"type": "result", "item": x, "index": len(results)-1})
+                        observed = attach_evidence_metadata(x, kind, q)
+                        results.append(observed)
+                        await ws.send_json({"type": "result", "item": observed, "index": len(results)-1})
             if not any(x.get("status") == "error" for x in results):
                 if len(_cache) >= MAX_CACHE_ENTRIES:
                     _cache.clear()
