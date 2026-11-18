@@ -1,4 +1,4 @@
-"""ATLAS OSINT PRO v0.3 — passive, source-linked investigation gateway.
+"""ATLAS OSINT PRO v0.4 — passive, source-linked investigation gateway.
 Developer: Suat DOĞU. Public data only. No intrusive scanning.
 Run: uvicorn main:app --host 0.0.0.0 --port 10000
 """
@@ -21,10 +21,11 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ROOT = Path(__file__).resolve().parent
 APP_TOKEN = os.environ.get("OSINT_APP_TOKEN", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 LOG = logging.getLogger("atlas-osint")
 logging.basicConfig(level=logging.INFO)
 
@@ -52,6 +53,11 @@ KINDS = {
     "wayback": "Wayback Machine / web arşivi",
     "openalex": "OpenAlex / akademik araştırma",
     "kev": "CISA KEV / istismar edildiği bilinen güvenlik açıkları",
+    "person_public": "Ad-soyad / açık kamusal kayıt adayları",
+    "social_profile": "Kullanıcı tarafından belirtilen açık sosyal profil",
+    "web_trace": "Alan adı dijital izi / DNS, RDAP, CT, arşiv",
+    "username_public": "Kullanıcı adı / iki ayrı açık profil adayı",
+    "company_public": "Şirket/kurum / kamusal kayıt adayları",
 }
 
 class SearchRequest(BaseModel):
@@ -85,7 +91,7 @@ def validate(kind: str, raw: str) -> str:
             raise ValueError("example.com biçiminde geçerli bir alan adı girin")
         if q.endswith((".local", ".internal", ".test", ".invalid")):
             raise ValueError("Yalnız kamusal alan adlarını araştırın")
-    elif kind == "wayback":
+    elif kind in ("wayback", "web_trace"):
         q = validate("domain", q)
     elif kind == "ip":
         try:
@@ -95,6 +101,28 @@ def validate(kind: str, raw: str) -> str:
         if not ip.is_global:
             raise ValueError("Yalnız genel internete açık IP adresleri sorgulanabilir")
         q = str(ip)
+    elif kind == "username_public":
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", q):
+            raise ValueError("Kullanıcı adını girin (yalnız ASCII harf, rakam ve tire; en fazla 39 karakter).")
+    elif kind == "company_public":
+        if not (3 <= len(q) <= 100) or not all(c.isalnum() or c in " -.,&'’()" for c in q):
+            raise ValueError("Kamusal kurum/şirket adı girin (3–100 karakter).")
+    elif kind == "person_public":
+        if len(q) > 80 or not (2 <= len(q.split()) <= 5) or not all(
+            c.isalpha() or c in " -'.’" for c in q
+        ):
+            raise ValueError("Yalnız ad ve soyad girin (2-5 kelime, en fazla 80 karakter).")
+    elif kind == "social_profile":
+        prefix, sep, handle = q.partition(":")
+        prefix = prefix.lower().strip()
+        handle = handle.strip().lstrip("@")
+        if not sep or prefix not in ("github", "bluesky"):
+            raise ValueError("github:kullanici veya bluesky:handle.bsky.social girin")
+        if prefix == "github":
+            validate("github_user", handle)
+        elif not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.\-]{1,245})[a-zA-Z0-9]", handle) or "." not in handle:
+            raise ValueError("Geçerli Bluesky handle girin (ör. bsky.app kullanıcı adı).")
+        q = prefix + ":" + handle.lower()
     elif kind == "github_user":
         if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", q):
             raise ValueError("Geçerli GitHub kullanıcı adı girin")
@@ -219,8 +247,109 @@ async def lookup_github_user(client, q):
     data = await get_json(client, "https://api.github.com/users/" + quote(q), headers=gh_headers())
     return [item("GitHub API", "Açık geliştirici profili", data.get("bio", "") or data.get("name", "") or q, data.get("html_url", ""), {
         "login": data.get("login"), "name": data.get("name"), "public_repos": data.get("public_repos"),
-        "followers": data.get("followers"), "created_at": data.get("created_at"), "updated_at": data.get("updated_at")
+        "followers": data.get("followers"), "created_at": data.get("created_at"), "updated_at": data.get("updated_at"),
+        "avatar_url": data.get("avatar_url"), "identity_match": "not_performed"
     })]
+
+
+async def lookup_public_wikidata(client, fullname):
+    # Candidate entries only. A matching name does NOT establish a verified person.
+    data = await get_json(client, "https://www.wikidata.org/w/api.php", {
+        "action": "wbsearchentities", "search": fullname, "language": "tr",
+        "uselang": "tr", "type": "item", "limit": 8, "format": "json"
+    })
+    return [item("Wikidata", "Kamusal kayıt adayı · " + x.get("label", ""),
+                 x.get("description", "") or "Açık ansiklopedik kayıt adayı",
+                 x.get("concepturi", "") or "https://www.wikidata.org/wiki/" + quote(x.get("id", "")),
+                 {"record_id": x.get("id"), "identity_match": "unverified_candidate", "query_is_name_only": True})
+            for x in data.get("search", [])[:8] if x.get("id")]
+
+
+async def lookup_public_academics(client, fullname):
+    params = {"search": fullname, "per-page": 8}
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
+    data = await get_json(client, "https://api.openalex.org/authors", params)
+    out = []
+    for x in data.get("results", [])[:8]:
+        institutions = [a.get("institution", {}).get("display_name", "") for a in x.get("affiliations", [])[:3]]
+        out.append(item("OpenAlex Authors", "Akademik kayıt adayı · " + x.get("display_name", ""),
+                        "Kayıtta bulunan yayın sayısı: " + str(x.get("works_count", 0)), x.get("id", ""),
+                        {"works_count": x.get("works_count"), "institutions": [a for a in institutions if a],
+                         "identity_match": "unverified_candidate", "query_is_name_only": True}))
+    return out
+
+
+async def lookup_social_profile(client, query):
+    provider, handle = query.split(":", 1)
+    if provider == "github":
+        rows = await lookup_github_user(client, handle)
+        for row in rows:
+            row["title"] = "Belirtilen GitHub profili · " + handle
+            row["fields"]["identity_match"] = "not_performed"
+        return rows
+    data = await get_json(client, "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile", {"actor": handle})
+    profile_handle = data.get("handle", handle)
+    return [item("Bluesky AppView", "Belirtilen Bluesky profili · @" + profile_handle,
+                 data.get("description") or "Kamuya açık profil bilgileri",
+                 "https://bsky.app/profile/" + quote(profile_handle, safe="."), {
+                     "handle": profile_handle, "display_name": data.get("displayName"),
+                     "avatar_url": data.get("avatar"), "followers": data.get("followersCount"),
+                     "follows": data.get("followsCount"), "posts": data.get("postsCount"),
+                     "identity_match": "not_performed"
+                 })]
+
+
+async def username_github_public(client, handle):
+    # Exact public-handle candidate only; never infer account ownership across sites.
+    try:
+        rows = await lookup_github_user(client, handle)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return []
+        raise
+    for row in rows:
+        row["title"] = "Kullanıcı adı kaydı · GitHub @" + handle
+        row["fields"]["identity_match"] = "unverified_handle_candidate"
+    return rows
+
+
+async def username_bluesky_public(client, handle):
+    bsky_handle = handle + ".bsky.social"
+    try:
+        rows = await lookup_social_profile(client, "bluesky:" + bsky_handle)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return []
+        raise
+    for row in rows:
+        row["title"] = "Kullanıcı adı kaydı · Bluesky @" + bsky_handle
+        row["fields"]["identity_match"] = "unverified_handle_candidate"
+    return rows
+
+
+async def lookup_company_wikidata(client, name):
+    data = await get_json(client, "https://www.wikidata.org/w/api.php", {
+        "action":"wbsearchentities", "search":name, "language":"en", "uselang":"en",
+        "type":"item", "limit":8, "format":"json"
+    })
+    return [item("Wikidata", "Kurumsal kayıt adayı · " + x.get("label", ""),
+                 x.get("description", "") or "Kamusal kurum kaydı adayı",
+                 x.get("concepturi", "") or "https://www.wikidata.org/wiki/" + quote(x.get("id", "")),
+                 {"record_id":x.get("id"), "identity_match":"unverified_company_candidate"})
+            for x in data.get("search", [])[:8] if x.get("id")]
+
+
+async def lookup_company_openalex(client, name):
+    params = {"search": name, "per-page": 8}
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
+    data = await get_json(client, "https://api.openalex.org/institutions", params)
+    return [item("OpenAlex Institutions", "Araştırma kurumu adayı · " + x.get("display_name", ""),
+                 "Açık akademik kurum kaydı; şirket sicili değildir.", x.get("id", ""),
+                 {"country_code":x.get("country_code"), "works_count":x.get("works_count"),
+                  "identity_match":"unverified_company_candidate"})
+            for x in data.get("results", [])[:8]]
 
 
 async def lookup_github_repos(client, q):
@@ -384,6 +513,22 @@ async def source_job(label: str, coroutine):
 
 
 def get_tasks(client, kind, q):
+    if kind == "username_public":
+        return [("GitHub Username", username_github_public(client, q)),
+                ("Bluesky Handle", username_bluesky_public(client, q))]
+    if kind == "company_public":
+        return [("Wikidata Organizations", lookup_company_wikidata(client, q)),
+                ("OpenAlex Institutions", lookup_company_openalex(client, q))]
+    if kind == "person_public":
+        return [("Wikidata", lookup_public_wikidata(client, q)),
+                ("OpenAlex Authors", lookup_public_academics(client, q))]
+    if kind == "social_profile":
+        return [("Public social profile", lookup_social_profile(client, q))]
+    if kind == "web_trace":
+        return [("Google Public DNS", domain_dns(client, q)),
+                ("RDAP Domain", domain_rdap(client, q)),
+                ("crt.sh", domain_ct(client, q)),
+                ("Wayback Machine", lookup_wayback(client, q))]
     if kind == "domain":
         return [("Google Public DNS", domain_dns(client, q)),
                 ("RDAP Domain", domain_rdap(client, q)),
@@ -406,7 +551,7 @@ def get_tasks(client, kind, q):
 
 def make_client():
     return httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True,
-                             headers={"User-Agent": "AtlasOSINTPro/0.3 (passive research)"},
+                             headers={"User-Agent": "AtlasOSINTPro/0.4 (passive research)"},
                              limits=httpx.Limits(max_connections=10))
 
 
@@ -437,7 +582,7 @@ async def home():
 async def health():
     return {"status": "ok", "version": VERSION, "protected": bool(APP_TOKEN),
             "ready": bool(APP_TOKEN), "sources": len(KINDS), "time_utc": now(),
-            "features": ["evidence_sha256", "relationship_graph", "timeline", "source_comparison", "case_export"]}
+            "features": ["evidence_sha256", "relationship_graph", "timeline", "source_comparison", "case_export", "public_name_candidates", "explicit_social_profile", "domain_footprint", "local_photo_metadata", "username_candidates", "organization_candidates", "local_header_analysis"]}
 
 
 @app.get("/api/sources")
