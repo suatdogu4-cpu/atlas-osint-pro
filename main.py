@@ -1,4 +1,4 @@
-"""ATLAS OSINT PRO v0.4 — passive, source-linked investigation gateway.
+"""ATLAS OSINT PRO v0.4.2 — passive, source-linked investigation gateway.
 Developer: Suat DOĞU. Public data only. No intrusive scanning.
 Run: uvicorn main:app --host 0.0.0.0 --port 10000
 """
@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +22,14 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 ROOT = Path(__file__).resolve().parent
 APP_TOKEN = os.environ.get("OSINT_APP_TOKEN", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
+# Wikimedia asks for an identifiable application and contact URL. A 403 is not
+# automatically recoverable; never proxy-hop around deliberate blocks.
+WIKIMEDIA_USER_AGENT = "AtlasOSINTPro/0.4.1 (https://github.com/suatdogu4-cpu/atlas-osint-pro; passive public-data research)"
 LOG = logging.getLogger("atlas-osint")
 logging.basicConfig(level=logging.INFO)
 
@@ -252,12 +256,24 @@ async def lookup_github_user(client, q):
     })]
 
 
+def wikidata_headers():
+    return {"User-Agent": WIKIMEDIA_USER_AGENT,
+            "Api-User-Agent": WIKIMEDIA_USER_AGENT,
+            "Accept": "application/json"}
+
+
+async def wikidata_search(client, name, lang):
+    # One official Action API request; if access is denied, expose the error.
+    return await get_json(client, "https://www.wikidata.org/w/api.php", {
+        "action": "wbsearchentities", "search": name, "language": lang,
+        "uselang": lang, "type": "item", "limit": 8,
+        "format": "json", "maxlag": 5
+    }, headers=wikidata_headers())
+
+
 async def lookup_public_wikidata(client, fullname):
     # Candidate entries only. A matching name does NOT establish a verified person.
-    data = await get_json(client, "https://www.wikidata.org/w/api.php", {
-        "action": "wbsearchentities", "search": fullname, "language": "tr",
-        "uselang": "tr", "type": "item", "limit": 8, "format": "json"
-    })
+    data = await wikidata_search(client, fullname, "tr")
     return [item("Wikidata", "Kamusal kayıt adayı · " + x.get("label", ""),
                  x.get("description", "") or "Açık ansiklopedik kayıt adayı",
                  x.get("concepturi", "") or "https://www.wikidata.org/wiki/" + quote(x.get("id", "")),
@@ -278,6 +294,44 @@ async def lookup_public_academics(client, fullname):
                         {"works_count": x.get("works_count"), "institutions": [a for a in institutions if a],
                          "identity_match": "unverified_candidate", "query_is_name_only": True}))
     return out
+
+
+def _norm_public_name(value):
+    """Only compare explicit author display names; never infer account ownership."""
+    value = unicodedata.normalize("NFKD", str(value).replace("ı", "i"))
+    return " ".join("".join(ch for ch in value if ch.isalnum() or ch.isspace()).casefold().split())
+
+
+async def lookup_public_crossref(client, fullname):
+    """Independent publication metadata search; exact public author names only.
+
+    Crossref is NOT a registry of people. No result is not evidence of absence.
+    """
+    data = await get_json(client, "https://api.crossref.org/works", {
+        "query.author": fullname, "rows": 12,
+        "select": "DOI,title,author,published,container-title"
+    })
+    target = _norm_public_name(fullname)
+    results = []
+    for work in data.get("message", {}).get("items", [])[:12]:
+        authors = work.get("author", [])
+        matched = []
+        for a in authors:
+            display = (a.get("given", "") + " " + a.get("family", "")).strip()
+            if _norm_public_name(display) == target:
+                matched.append(display)
+        if not matched:
+            continue
+        doi = str(work.get("DOI", ""))
+        title = (work.get("title") or ["Kaynaklı yayın"])[0]
+        journal = (work.get("container-title") or [""])[0]
+        results.append(item("Crossref", "Yayın yazarı aday kaydı · " + matched[0],
+                            title, "https://doi.org/" + quote(doi, safe="/") if doi else "",
+                            {"journal": journal, "doi": doi, "identity_match": "unverified_candidate",
+                             "query_is_name_only": True, "source_scope": "publication_metadata"}))
+        if len(results) >= 5:
+            break
+    return results
 
 
 async def lookup_social_profile(client, query):
@@ -329,10 +383,7 @@ async def username_bluesky_public(client, handle):
 
 
 async def lookup_company_wikidata(client, name):
-    data = await get_json(client, "https://www.wikidata.org/w/api.php", {
-        "action":"wbsearchentities", "search":name, "language":"en", "uselang":"en",
-        "type":"item", "limit":8, "format":"json"
-    })
+    data = await wikidata_search(client, name, "en")
     return [item("Wikidata", "Kurumsal kayıt adayı · " + x.get("label", ""),
                  x.get("description", "") or "Kamusal kurum kaydı adayı",
                  x.get("concepturi", "") or "https://www.wikidata.org/wiki/" + quote(x.get("id", "")),
@@ -483,7 +534,15 @@ async def lookup_epss(client, cve):
 def safe_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        return f"Kaynak HTTP {status} yanıtı verdi; kota veya erişim kısıtı olabilir."
+        host = exc.response.request.url.host or ""
+        if status == 403 and host.endswith("wikidata.org"):
+            return ("Wikidata HTTP 403: Wikimedia isteği reddetti. Bu, aranan kaydın "
+                    "mevcut olmadığı anlamına gelmez; erişim veya sunucu politikası kısıtı olabilir.")
+        if status == 403:
+            return "Kaynak HTTP 403: erişim reddedildi; erişim yetkisi veya kaynak politikası kontrol edilmeli."
+        if status == 429:
+            return "Kaynak HTTP 429: istek kotası aşıldı; tekrar denemeden önce bekleyin."
+        return f"Kaynak HTTP {status} yanıtı verdi; erişim ya da kaynak hatası olabilir."
     if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
         return "Kaynak zaman aşımına uğradı."
     if isinstance(exc, httpx.RequestError):
@@ -521,7 +580,8 @@ def get_tasks(client, kind, q):
                 ("OpenAlex Institutions", lookup_company_openalex(client, q))]
     if kind == "person_public":
         return [("Wikidata", lookup_public_wikidata(client, q)),
-                ("OpenAlex Authors", lookup_public_academics(client, q))]
+                ("OpenAlex Authors", lookup_public_academics(client, q)),
+                ("Crossref Publications", lookup_public_crossref(client, q))]
     if kind == "social_profile":
         return [("Public social profile", lookup_social_profile(client, q))]
     if kind == "web_trace":
@@ -551,7 +611,7 @@ def get_tasks(client, kind, q):
 
 def make_client():
     return httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True,
-                             headers={"User-Agent": "AtlasOSINTPro/0.4 (passive research)"},
+                             headers={"User-Agent": WIKIMEDIA_USER_AGENT},
                              limits=httpx.Limits(max_connections=10))
 
 
